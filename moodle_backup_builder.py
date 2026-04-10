@@ -58,7 +58,7 @@ class MoodleBackupBuilder:
     def __init__(self, *, title, time_open, time_close, timelimit,
                  mc_points, essay_points, sections,
                  contact_name="Edwin", contact_email="edwinsu@dsv.su.se",
-                 now=None):
+                 include_qa_forum=True, now=None):
         self.title = title
         self.time_open = time_open
         self.time_close = time_close
@@ -68,6 +68,7 @@ class MoodleBackupBuilder:
         self.sections = sections
         self.contact_name = contact_name
         self.contact_email = contact_email
+        self.include_qa_forum = include_qa_forum
         self.now = now or int(time.time())
 
         total_mc = sum(len(s["mc_questions"]) for s in sections)
@@ -457,12 +458,12 @@ class MoodleBackupBuilder:
         # Grade feedback boundaries
         lines.append(f'    <feedbacks>')
         boundaries = [
-            (90.0, 100.01, "Grade: A - Excellent"),
-            (80.0, 90.0, "Grade: B - Very Good"),
-            (70.0, 80.0, "Grade: C - Good"),
-            (60.0, 70.0, "Grade: D - Satisfactory"),
-            (50.0, 60.0, "Grade: E - Adequate (Pass)"),
-            (0.0, 50.0, "Grade: F - Fail"),
+            (90.0, 100.01, "Preliminary grade: A"),
+            (80.0, 90.0, "Preliminary grade: B"),
+            (70.0, 80.0, "Preliminary grade: C"),
+            (60.0, 70.0, "Preliminary grade: D"),
+            (50.0, 60.0, "Preliminary grade: E"),
+            (0.0, 50.0, "Preliminary grade: F"),
         ]
         for fid, (lo, hi, text) in enumerate(boundaries, 1):
             lines.append(f'      <feedback id="{fid}">')
@@ -515,13 +516,27 @@ class MoodleBackupBuilder:
             f"with others is allowed, except with teachers and exam invigilators.&lt;/em&gt;&lt;/p&gt;"
 
             f"&lt;p&gt;Information från kursansvarig under tentamen ges i forumet "
-            f"&amp;quot;Information från kursledningen&amp;quot;.&lt;br&gt;"
-            f"Det finns även en möjlighet att skriva frågor till kursledningen i forumet "
-            f"&amp;quot;Frågor till lärarna under tentamen&amp;quot;.&lt;/p&gt;"
+            f"&amp;quot;Information från kursledningen&amp;quot;."
+        )
+        if self.include_qa_forum:
+            info += (
+                f"&lt;br&gt;"
+                f"Det finns även en möjlighet att skriva frågor till kursledningen i forumet "
+                f"&amp;quot;Frågor till lärarna under tentamen&amp;quot;."
+            )
+        info += (
+            f"&lt;/p&gt;"
             f"&lt;p&gt;&lt;em&gt;Information from the course coordinator during the exam is provided in the forum "
-            f"&amp;quot;Information från kursledningen&amp;quot;.&lt;br&gt;"
-            f"You can also ask questions to the teachers in the forum "
-            f"&amp;quot;Frågor till lärarna under tentamen&amp;quot;.&lt;/em&gt;&lt;/p&gt;"
+            f"&amp;quot;Information från kursledningen&amp;quot;."
+        )
+        if self.include_qa_forum:
+            info += (
+                f"&lt;br&gt;"
+                f"You can also ask questions to the teachers in the forum "
+                f"&amp;quot;Frågor till lärarna under tentamen&amp;quot;."
+            )
+        info += (
+            f"&lt;/em&gt;&lt;/p&gt;"
 
             f"&lt;h3&gt;Poängfördelning / Point distribution&lt;/h3&gt;"
             f"&lt;p&gt;This exam contains:&lt;/p&gt;&lt;ul&gt;{breakdown}&lt;/ul&gt;"
@@ -535,10 +550,10 @@ class MoodleBackupBuilder:
             f"&lt;p&gt;Minimipoäng för de olika betygen / Minimum points for each grade:"
             f"{grade_rows}&lt;/p&gt;"
             f"&lt;p&gt;&lt;strong&gt;Totalt kan {total_mc_pts:.0f}p erhållas på flervalsfrågorna. "
-            f"För betyg högre än D ({self.total_points * 0.6:.0f}p) krävs även poäng på essäfrågorna.&lt;/strong&gt;&lt;/p&gt;"
+            f"För betyg högre än D ({self.total_points * 0.6:.0f}p) krävs poäng på båda essäfrågorna.&lt;/strong&gt;&lt;/p&gt;"
             f"&lt;p&gt;&lt;strong&gt;&lt;em&gt;A total of {total_mc_pts:.0f}p can be earned from multiple choice questions. "
             f"To achieve a grade higher than D ({self.total_points * 0.6:.0f}p), "
-            f"points on the essay questions are also required.&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;"
+            f"points on both essay questions are required.&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;"
         )
 
         # Section minimum requirements
@@ -774,13 +789,18 @@ class MoodleBackupBuilder:
         return '\n'.join(lines)
 
     def _section_xml(self):
+        seq = [self.DISCLAIMER_MODULE_ID, self.LABEL_MODULE_ID, self.NEWS_FORUM_MODULE_ID]
+        if self.include_qa_forum:
+            seq.append(self.QA_FORUM_MODULE_ID)
+        seq.append(self.QUIZ_MODULE_ID)
+        seq_str = ",".join(str(s) for s in seq)
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <section id="{self.SECTION_ID}">
   <number>0</number>
   <name>{escape(self.title)}</name>
   <summary></summary>
   <summaryformat>1</summaryformat>
-  <sequence>{self.DISCLAIMER_MODULE_ID},{self.LABEL_MODULE_ID},{self.NEWS_FORUM_MODULE_ID},{self.QA_FORUM_MODULE_ID},{self.QUIZ_MODULE_ID}</sequence>
+  <sequence>{seq_str}</sequence>
   <visible>1</visible>
   <availabilityjson>$@NULL@$</availabilityjson>
   <timemodified>{self.now}</timemodified>
@@ -916,6 +936,71 @@ class MoodleBackupBuilder:
         return '\n'.join(lines)
 
     def _moodle_backup_xml(self, filename):
+        def _activity(mid, mname, title, directory):
+            return (f'        <activity>\n'
+                    f'          <moduleid>{mid}</moduleid>\n'
+                    f'          <sectionid>{self.SECTION_ID}</sectionid>\n'
+                    f'          <modulename>{mname}</modulename>\n'
+                    f'          <title>{title}</title>\n'
+                    f'          <directory>{directory}</directory>\n'
+                    f'          <insubsection></insubsection>\n'
+                    f'        </activity>')
+
+        def _setting(level, name, value, ref_type=None, ref_id=None):
+            s = f'      <setting><level>{level}</level>'
+            if ref_type:
+                s += f'<{ref_type}>{ref_id}</{ref_type}>'
+            s += f'<name>{name}</name><value>{value}</value></setting>'
+            return s
+
+        activities = [
+            _activity(self.DISCLAIMER_MODULE_ID, "label", "DO NOT EDIT - Generated page", f"activities/label_{self.DISCLAIMER_MODULE_ID}"),
+            _activity(self.LABEL_MODULE_ID, "label", "Exam Information", f"activities/label_{self.LABEL_MODULE_ID}"),
+            _activity(self.NEWS_FORUM_MODULE_ID, "forum", "Information från kursledningen", f"activities/forum_{self.NEWS_FORUM_MODULE_ID}"),
+        ]
+        if self.include_qa_forum:
+            activities.append(_activity(self.QA_FORUM_MODULE_ID, "forum", "Frågor till lärarna under tentamen", f"activities/forum_{self.QA_FORUM_MODULE_ID}"))
+        activities.append(_activity(self.QUIZ_MODULE_ID, "quiz", escape(self.title), f"activities/quiz_{self.QUIZ_MODULE_ID}"))
+
+        settings = [
+            _setting("root", "filename", escape(filename)),
+            _setting("root", "users", "0"),
+            _setting("root", "anonymize", "0"),
+            _setting("root", "role_assignments", "0"),
+            _setting("root", "activities", "1"),
+            _setting("root", "blocks", "0"),
+            _setting("root", "files", "1"),
+            _setting("root", "filters", "1"),
+            _setting("root", "comments", "0"),
+            _setting("root", "badges", "0"),
+            _setting("root", "calendarevents", "0"),
+            _setting("root", "userscompletion", "0"),
+            _setting("root", "logs", "0"),
+            _setting("root", "grade_histories", "0"),
+            _setting("root", "questionbank", "1"),
+            _setting("root", "groups", "0"),
+            _setting("root", "competencies", "0"),
+            _setting("root", "customfield", "0"),
+            _setting("root", "contentbankcontent", "0"),
+            _setting("root", "legacyfiles", "0"),
+            _setting("section", f"section_{self.SECTION_ID}_included", "1", "section", f"section_{self.SECTION_ID}"),
+            _setting("section", f"section_{self.SECTION_ID}_userinfo", "0", "section", f"section_{self.SECTION_ID}"),
+            _setting("activity", f"label_{self.DISCLAIMER_MODULE_ID}_included", "1", "activity", f"label_{self.DISCLAIMER_MODULE_ID}"),
+            _setting("activity", f"label_{self.DISCLAIMER_MODULE_ID}_userinfo", "0", "activity", f"label_{self.DISCLAIMER_MODULE_ID}"),
+            _setting("activity", f"label_{self.LABEL_MODULE_ID}_included", "1", "activity", f"label_{self.LABEL_MODULE_ID}"),
+            _setting("activity", f"label_{self.LABEL_MODULE_ID}_userinfo", "0", "activity", f"label_{self.LABEL_MODULE_ID}"),
+            _setting("activity", f"forum_{self.NEWS_FORUM_MODULE_ID}_included", "1", "activity", f"forum_{self.NEWS_FORUM_MODULE_ID}"),
+            _setting("activity", f"forum_{self.NEWS_FORUM_MODULE_ID}_userinfo", "0", "activity", f"forum_{self.NEWS_FORUM_MODULE_ID}"),
+        ]
+        if self.include_qa_forum:
+            settings.append(_setting("activity", f"forum_{self.QA_FORUM_MODULE_ID}_included", "1", "activity", f"forum_{self.QA_FORUM_MODULE_ID}"))
+            settings.append(_setting("activity", f"forum_{self.QA_FORUM_MODULE_ID}_userinfo", "0", "activity", f"forum_{self.QA_FORUM_MODULE_ID}"))
+        settings.append(_setting("activity", f"quiz_{self.QUIZ_MODULE_ID}_included", "1", "activity", f"quiz_{self.QUIZ_MODULE_ID}"))
+        settings.append(_setting("activity", f"quiz_{self.QUIZ_MODULE_ID}_userinfo", "0", "activity", f"quiz_{self.QUIZ_MODULE_ID}"))
+
+        activities_xml = '\n'.join(activities)
+        settings_xml = '\n'.join(settings)
+
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <moodle_backup>
   <information>
@@ -950,46 +1035,7 @@ class MoodleBackupBuilder:
     </details>
     <contents>
       <activities>
-        <activity>
-          <moduleid>{self.DISCLAIMER_MODULE_ID}</moduleid>
-          <sectionid>{self.SECTION_ID}</sectionid>
-          <modulename>label</modulename>
-          <title>DO NOT EDIT - Generated page</title>
-          <directory>activities/label_{self.DISCLAIMER_MODULE_ID}</directory>
-          <insubsection></insubsection>
-        </activity>
-        <activity>
-          <moduleid>{self.LABEL_MODULE_ID}</moduleid>
-          <sectionid>{self.SECTION_ID}</sectionid>
-          <modulename>label</modulename>
-          <title>Exam Information</title>
-          <directory>activities/label_{self.LABEL_MODULE_ID}</directory>
-          <insubsection></insubsection>
-        </activity>
-        <activity>
-          <moduleid>{self.NEWS_FORUM_MODULE_ID}</moduleid>
-          <sectionid>{self.SECTION_ID}</sectionid>
-          <modulename>forum</modulename>
-          <title>Information från kursledningen</title>
-          <directory>activities/forum_{self.NEWS_FORUM_MODULE_ID}</directory>
-          <insubsection></insubsection>
-        </activity>
-        <activity>
-          <moduleid>{self.QA_FORUM_MODULE_ID}</moduleid>
-          <sectionid>{self.SECTION_ID}</sectionid>
-          <modulename>forum</modulename>
-          <title>Frågor till lärarna under tentamen</title>
-          <directory>activities/forum_{self.QA_FORUM_MODULE_ID}</directory>
-          <insubsection></insubsection>
-        </activity>
-        <activity>
-          <moduleid>{self.QUIZ_MODULE_ID}</moduleid>
-          <sectionid>{self.SECTION_ID}</sectionid>
-          <modulename>quiz</modulename>
-          <title>{escape(self.title)}</title>
-          <directory>activities/quiz_{self.QUIZ_MODULE_ID}</directory>
-          <insubsection></insubsection>
-        </activity>
+{activities_xml}
       </activities>
       <sections>
         <section>
@@ -1007,38 +1053,7 @@ class MoodleBackupBuilder:
       </course>
     </contents>
     <settings>
-      <setting><level>root</level><name>filename</name><value>{escape(filename)}</value></setting>
-      <setting><level>root</level><name>users</name><value>0</value></setting>
-      <setting><level>root</level><name>anonymize</name><value>0</value></setting>
-      <setting><level>root</level><name>role_assignments</name><value>0</value></setting>
-      <setting><level>root</level><name>activities</name><value>1</value></setting>
-      <setting><level>root</level><name>blocks</name><value>0</value></setting>
-      <setting><level>root</level><name>files</name><value>1</value></setting>
-      <setting><level>root</level><name>filters</name><value>1</value></setting>
-      <setting><level>root</level><name>comments</name><value>0</value></setting>
-      <setting><level>root</level><name>badges</name><value>0</value></setting>
-      <setting><level>root</level><name>calendarevents</name><value>0</value></setting>
-      <setting><level>root</level><name>userscompletion</name><value>0</value></setting>
-      <setting><level>root</level><name>logs</name><value>0</value></setting>
-      <setting><level>root</level><name>grade_histories</name><value>0</value></setting>
-      <setting><level>root</level><name>questionbank</name><value>1</value></setting>
-      <setting><level>root</level><name>groups</name><value>0</value></setting>
-      <setting><level>root</level><name>competencies</name><value>0</value></setting>
-      <setting><level>root</level><name>customfield</name><value>0</value></setting>
-      <setting><level>root</level><name>contentbankcontent</name><value>0</value></setting>
-      <setting><level>root</level><name>legacyfiles</name><value>0</value></setting>
-      <setting><level>section</level><section>section_{self.SECTION_ID}</section><name>section_{self.SECTION_ID}_included</name><value>1</value></setting>
-      <setting><level>section</level><section>section_{self.SECTION_ID}</section><name>section_{self.SECTION_ID}_userinfo</name><value>0</value></setting>
-      <setting><level>activity</level><activity>label_{self.DISCLAIMER_MODULE_ID}</activity><name>label_{self.DISCLAIMER_MODULE_ID}_included</name><value>1</value></setting>
-      <setting><level>activity</level><activity>label_{self.DISCLAIMER_MODULE_ID}</activity><name>label_{self.DISCLAIMER_MODULE_ID}_userinfo</name><value>0</value></setting>
-      <setting><level>activity</level><activity>label_{self.LABEL_MODULE_ID}</activity><name>label_{self.LABEL_MODULE_ID}_included</name><value>1</value></setting>
-      <setting><level>activity</level><activity>label_{self.LABEL_MODULE_ID}</activity><name>label_{self.LABEL_MODULE_ID}_userinfo</name><value>0</value></setting>
-      <setting><level>activity</level><activity>forum_{self.NEWS_FORUM_MODULE_ID}</activity><name>forum_{self.NEWS_FORUM_MODULE_ID}_included</name><value>1</value></setting>
-      <setting><level>activity</level><activity>forum_{self.NEWS_FORUM_MODULE_ID}</activity><name>forum_{self.NEWS_FORUM_MODULE_ID}_userinfo</name><value>0</value></setting>
-      <setting><level>activity</level><activity>forum_{self.QA_FORUM_MODULE_ID}</activity><name>forum_{self.QA_FORUM_MODULE_ID}_included</name><value>1</value></setting>
-      <setting><level>activity</level><activity>forum_{self.QA_FORUM_MODULE_ID}</activity><name>forum_{self.QA_FORUM_MODULE_ID}_userinfo</name><value>0</value></setting>
-      <setting><level>activity</level><activity>quiz_{self.QUIZ_MODULE_ID}</activity><name>quiz_{self.QUIZ_MODULE_ID}_included</name><value>1</value></setting>
-      <setting><level>activity</level><activity>quiz_{self.QUIZ_MODULE_ID}</activity><name>quiz_{self.QUIZ_MODULE_ID}_userinfo</name><value>0</value></setting>
+{settings_xml}
     </settings>
   </information>
 </moodle_backup>
@@ -1110,10 +1125,10 @@ class MoodleBackupBuilder:
 
             # Forums
             EMPTY_GRADING = EMPTY_XML + '<areas>\n</areas>\n'
-            for mid, forum_xml in [
-                (self.NEWS_FORUM_MODULE_ID, self._make_news_forum_xml()),
-                (self.QA_FORUM_MODULE_ID, self._make_qa_forum_xml()),
-            ]:
+            forums = [(self.NEWS_FORUM_MODULE_ID, self._make_news_forum_xml())]
+            if self.include_qa_forum:
+                forums.append((self.QA_FORUM_MODULE_ID, self._make_qa_forum_xml()))
+            for mid, forum_xml in forums:
                 fp = f"activities/forum_{mid}"
                 add(tar, f"{fp}/forum.xml", forum_xml)
                 add(tar, f"{fp}/module.xml", self._module_xml(mid, "forum"))

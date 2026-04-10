@@ -41,6 +41,8 @@ def parse_args():
                    help="Override points per essay question")
     p.add_argument("--contact-name", default=None, help="Override contact name")
     p.add_argument("--contact-email", default=None, help="Override contact email")
+    p.add_argument("--no-qa-forum", action="store_true",
+                   help="Exclude the student Q&A forum")
     return p.parse_args()
 
 
@@ -148,6 +150,7 @@ def main():
         sections=sections,
         contact_name=contact_name,
         contact_email=contact_email,
+        include_qa_forum=not args.no_qa_forum,
     )
     builder.build(output)
 
