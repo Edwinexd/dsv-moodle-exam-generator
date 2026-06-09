@@ -1,0 +1,2 @@
+# No third-party dependencies — the generator uses only the Python 3 standard
+# library (argparse, csv, json, random, re, tarfile, datetime, html, pathlib).

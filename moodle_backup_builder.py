@@ -58,132 +58,213 @@ class MoodleBackupBuilder:
     def __init__(self, *, title, time_open, time_close, timelimit,
                  mc_points, essay_points, sections,
                  contact_name="Edwin", contact_email="edwinsu@dsv.su.se",
-                 include_qa_forum=True, now=None):
+                 include_qa_forum=True, essays_last=True,
+                 grade_letters=None, embed_grade_feedback=True,
+                 programming_min_points=None, now=None):
         self.title = title
         self.time_open = time_open
         self.time_close = time_close
         self.timelimit = timelimit
         self.mc_points = mc_points
         self.essay_points = essay_points
-        self.sections = sections
         self.contact_name = contact_name
         self.contact_email = contact_email
         self.include_qa_forum = include_qa_forum
+        # essays_last: PVT15 layout groups all essays after the MC. IDSV keeps
+        # questions in section order (set essays_last=False).
+        self.essays_last = essays_last
         self.now = now or int(time.time())
 
-        total_mc = sum(len(s["mc_questions"]) for s in sections)
-        total_essays = sum(1 for s in sections if s.get("essay"))
-        self.total_points = total_mc * mc_points + total_essays * essay_points
+        self.sections = [self._normalize_section(s) for s in sections]
+        self.total_points = sum(
+            item["points"] for s in self.sections for item in s["items"])
+
+        # Grade scheme as a list of (letter, min_points_absolute), highest first.
+        # Default: Bologna percentages of the total (PVT15). IDSV passes its own
+        # absolute thresholds (A 34, B 32, ...). embed_grade_feedback controls
+        # whether per-grade boundaries are baked into the quiz/gradebook (the old
+        # IDSV exam left them out and stated criteria only in the info label).
+        if grade_letters is None:
+            grade_letters = [(l, self.total_points * p / 100)
+                             for p, l in GRADE_LETTERS]
+        self.grade_letters = grade_letters
+        self.embed_grade_feedback = embed_grade_feedback
+        self.programming_min_points = programming_min_points
+        # Lowest passing mark = the lowest non-failing letter's threshold.
+        passing = [m for l, m in grade_letters if l not in ("F", "FX")]
+        self.grade_pass = min(passing) if passing else 0.0
+
+    def _normalize_section(self, sec):
+        """Ensure a section has an `items` list. Back-compat: build items from
+        the old mc_questions/essay shape when `items` is absent."""
+        if "items" in sec:
+            for item in sec["items"]:
+                item.setdefault("points", 0.0)
+            return sec
+        items = []
+        for q in sec.get("mc_questions", []):
+            items.append({"qtype": "multichoice", "q": q,
+                          "points": self.mc_points})
+        if sec.get("essay"):
+            items.append({"qtype": "essay", "name": sec["essay"]["name"],
+                          "text": sec["essay"]["text"],
+                          "points": self.essay_points, "raw_text": False})
+        return {"name": sec["name"], "items": items,
+                "min_points": sec.get("min_points")}
 
     # -- questions.xml -------------------------------------------------------
 
-    def _mc_question_xml(self, q, question_id, cat_id, answer_id_start):
-        lines = []
-        is_single = q["type"] == "single"
-        correct_choices = [c for c in q["choices"] if c["correct"]]
-        num_correct = len(correct_choices)
-        q_name = escape(f"{q.get('topic', '')} - {q['question'][:60]}")
+    # Empty qbank plugin wrappers present on every question in a 4.5 export.
+    QBANK_WRAPPERS = (
+        '                <plugin_qbank_comment_question>\n'
+        '                  <comments>\n'
+        '                  </comments>\n'
+        '                </plugin_qbank_comment_question>\n'
+        '                <plugin_qbank_customfields_question>\n'
+        '                  <customfields>\n'
+        '                  </customfields>\n'
+        '                </plugin_qbank_customfields_question>')
 
-        lines.append(f'      <question_bank_entry id="{question_id}">')
-        lines.append(f'        <questioncategoryid>{cat_id}</questioncategoryid>')
-        lines.append(f'        <idnumber>$@NULL@$</idnumber>')
-        lines.append(f'        <ownerid>1</ownerid>')
-        lines.append(f'        <question_version>')
-        lines.append(f'          <question_versions id="{question_id + 5000}">')
-        lines.append(f'            <version>1</version>')
-        lines.append(f'            <status>ready</status>')
-        lines.append(f'            <questions>')
-        lines.append(f'              <question id="{question_id + 10000}">')
-        lines.append(f'                <parent>0</parent>')
-        lines.append(f'                <name>{q_name}</name>')
-        lines.append(f'                <questiontext>{escape(q["question"])}</questiontext>')
-        lines.append(f'                <questiontextformat>1</questiontextformat>')
-        lines.append(f'                <generalfeedback></generalfeedback>')
-        lines.append(f'                <generalfeedbackformat>1</generalfeedbackformat>')
-        lines.append(f'                <defaultmark>{self.mc_points:.7f}</defaultmark>')
-        lines.append(f'                <penalty>0.3333333</penalty>')
-        lines.append(f'                <qtype>multichoice</qtype>')
-        lines.append(f'                <length>1</length>')
-        lines.append(f'                <stamp>exam+{self.now}+q{question_id}</stamp>')
-        lines.append(f'                <timecreated>{self.now}</timecreated>')
-        lines.append(f'                <timemodified>{self.now}</timemodified>')
-        lines.append(f'                <createdby>1</createdby>')
-        lines.append(f'                <modifiedby>1</modifiedby>')
-        lines.append(f'                <plugin_qtype_multichoice_question>')
-        lines.append(f'                  <answers>')
+    def _render_entry(self, *, qid, cat_id, name, questiontext, qtype, points,
+                      plugin_xml, penalty=0.0, length=1, generalfeedback="",
+                      raw_text=False, raw_feedback=False):
+        """Build one <question_bank_entry> wrapping any qtype.
 
-        frac_map = {1: 1.0, 2: 0.5, 3: 0.3333333, 4: 0.25, 5: 0.2}
-        pos_frac = frac_map.get(num_correct, 1.0)
-        neg_frac = -pos_frac
-        aid = answer_id_start
-        for c in q["choices"]:
-            if is_single:
-                frac = 1.0 if c["correct"] else 0.0
-            else:
-                frac = pos_frac if c["correct"] else neg_frac
-            lines.append(f'                    <answer id="{aid}">')
-            lines.append(f'                      <answertext>{escape(c["text"])}</answertext>')
-            lines.append(f'                      <answerformat>1</answerformat>')
-            lines.append(f'                      <fraction>{frac:.7f}</fraction>')
-            lines.append(f'                      <feedback></feedback>')
-            lines.append(f'                      <feedbackformat>1</feedbackformat>')
-            lines.append(f'                    </answer>')
-            aid += 1
-
-        lines.append(f'                  </answers>')
-        lines.append(f'                  <multichoice id="{question_id + 10000}">')
-        lines.append(f'                    <layout>0</layout>')
-        lines.append(f'                    <single>{1 if is_single else 0}</single>')
-        lines.append(f'                    <shuffleanswers>1</shuffleanswers>')
-        lines.append(f'                    <correctfeedback>Correct.</correctfeedback>')
-        lines.append(f'                    <correctfeedbackformat>1</correctfeedbackformat>')
-        lines.append(f'                    <partiallycorrectfeedback>Partially correct.</partiallycorrectfeedback>')
-        lines.append(f'                    <partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat>')
-        lines.append(f'                    <incorrectfeedback>Incorrect.</incorrectfeedback>')
-        lines.append(f'                    <incorrectfeedbackformat>1</incorrectfeedbackformat>')
-        lines.append(f'                    <answernumbering>abc</answernumbering>')
-        lines.append(f'                    <shownumcorrect>1</shownumcorrect>')
-        lines.append(f'                    <showstandardinstruction>0</showstandardinstruction>')
-        lines.append(f'                  </multichoice>')
-        lines.append(f'                </plugin_qtype_multichoice_question>')
-        lines.append(f'                <question_hints></question_hints>')
-        lines.append(f'                <tags></tags>')
-        lines.append(f'              </question>')
-        lines.append(f'            </questions>')
-        lines.append(f'          </question_versions>')
-        lines.append(f'        </question_version>')
-        lines.append(f'      </question_bank_entry>')
-        return '\n'.join(lines), aid
-
-    def _essay_question_xml(self, name, text, question_id, cat_id, points=None):
-        pts = points if points is not None else self.essay_points
-        return f"""      <question_bank_entry id="{question_id}">
+        questiontext / generalfeedback are escaped unless raw_* is set (the
+        coderunner block arrives pre-escaped from the export)."""
+        qt = questiontext if raw_text else escape(questiontext)
+        gf = generalfeedback if raw_feedback else escape(generalfeedback)
+        plugin = (plugin_xml + "\n") if plugin_xml else ""
+        return f"""      <question_bank_entry id="{qid}">
         <questioncategoryid>{cat_id}</questioncategoryid>
         <idnumber>$@NULL@$</idnumber>
         <ownerid>1</ownerid>
         <question_version>
-          <question_versions id="{question_id + 5000}">
+          <question_versions id="{qid + 5000}">
             <version>1</version>
             <status>ready</status>
             <questions>
-              <question id="{question_id + 10000}">
+              <question id="{qid + 10000}">
                 <parent>0</parent>
                 <name>{escape(name)}</name>
-                <questiontext>{escape(text)}</questiontext>
+                <questiontext>{qt}</questiontext>
                 <questiontextformat>1</questiontextformat>
-                <generalfeedback></generalfeedback>
+                <generalfeedback>{gf}</generalfeedback>
                 <generalfeedbackformat>1</generalfeedbackformat>
-                <defaultmark>{pts:.7f}</defaultmark>
-                <penalty>0.0000000</penalty>
-                <qtype>essay</qtype>
-                <length>1</length>
-                <stamp>exam+{self.now}+q{question_id}</stamp>
+                <defaultmark>{points:.7f}</defaultmark>
+                <penalty>{penalty:.7f}</penalty>
+                <qtype>{qtype}</qtype>
+                <length>{length}</length>
+                <stamp>exam+{self.now}+q{qid}</stamp>
                 <timecreated>{self.now}</timecreated>
                 <timemodified>{self.now}</timemodified>
                 <createdby>1</createdby>
                 <modifiedby>1</modifiedby>
-                <plugin_qtype_essay_question>
-                  <essay id="{question_id + 10000}">
+{plugin}{self.QBANK_WRAPPERS}
+                <question_hints></question_hints>
+                <tags></tags>
+              </question>
+            </questions>
+          </question_versions>
+        </question_version>
+      </question_bank_entry>"""
+
+    # -- per-qtype plugin blocks --------------------------------------------
+
+    def _mc_plugin(self, q, inner_id, aid):
+        is_single = q["type"] == "single"
+        num_correct = sum(1 for c in q["choices"] if c["correct"])
+        frac_map = {1: 1.0, 2: 0.5, 3: 0.3333333, 4: 0.25, 5: 0.2}
+        pos_frac = frac_map.get(num_correct, 1.0)
+        lines = ['                <plugin_qtype_multichoice_question>',
+                 '                  <answers>']
+        for c in q["choices"]:
+            if is_single:
+                frac = 1.0 if c["correct"] else 0.0
+            else:
+                frac = pos_frac if c["correct"] else -pos_frac
+            lines += [f'                    <answer id="{aid}">',
+                      f'                      <answertext>{escape(c["text"])}</answertext>',
+                      '                      <answerformat>1</answerformat>',
+                      f'                      <fraction>{frac:.7f}</fraction>',
+                      '                      <feedback></feedback>',
+                      '                      <feedbackformat>1</feedbackformat>',
+                      '                    </answer>']
+            aid += 1
+        lines += [
+            '                  </answers>',
+            f'                  <multichoice id="{inner_id}">',
+            '                    <layout>0</layout>',
+            f'                    <single>{1 if is_single else 0}</single>',
+            '                    <shuffleanswers>1</shuffleanswers>',
+            '                    <correctfeedback>Correct.</correctfeedback>',
+            '                    <correctfeedbackformat>1</correctfeedbackformat>',
+            '                    <partiallycorrectfeedback>Partially correct.</partiallycorrectfeedback>',
+            '                    <partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat>',
+            '                    <incorrectfeedback>Incorrect.</incorrectfeedback>',
+            '                    <incorrectfeedbackformat>1</incorrectfeedbackformat>',
+            '                    <answernumbering>abc</answernumbering>',
+            '                    <shownumcorrect>1</shownumcorrect>',
+            '                    <showstandardinstruction>0</showstandardinstruction>',
+            '                  </multichoice>',
+            '                </plugin_qtype_multichoice_question>']
+        return '\n'.join(lines), aid
+
+    def _gapselect_plugin(self, item, inner_id, aid):
+        """Unified dropdown. [[N]] in the text picks option N (1-based); all
+        options share group 1; fraction is unused (gapselect convention)."""
+        lines = ['                <plugin_qtype_gapselect_question>',
+                 '                  <answers>']
+        for opt in item["options"]:
+            lines += [f'                    <answer id="{aid}">',
+                      f'                      <answertext>{escape(opt)}</answertext>',
+                      '                      <answerformat>1</answerformat>',
+                      '                      <fraction>0.0000000</fraction>',
+                      '                      <feedback>1</feedback>',
+                      '                      <feedbackformat>0</feedbackformat>',
+                      '                    </answer>']
+            aid += 1
+        shuffle = 1 if item.get("shuffle", True) else 0
+        lines += [
+            '                  </answers>',
+            f'                  <gapselect id="{inner_id}">',
+            f'                    <shuffleanswers>{shuffle}</shuffleanswers>',
+            '                    <correctfeedback></correctfeedback>',
+            '                    <correctfeedbackformat>1</correctfeedbackformat>',
+            '                    <partiallycorrectfeedback></partiallycorrectfeedback>',
+            '                    <partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat>',
+            '                    <incorrectfeedback></incorrectfeedback>',
+            '                    <incorrectfeedbackformat>1</incorrectfeedbackformat>',
+            '                    <shownumcorrect>1</shownumcorrect>',
+            '                  </gapselect>',
+            '                </plugin_qtype_gapselect_question>']
+        return '\n'.join(lines), aid
+
+    def _shortanswer_plugin(self, item, inner_id, aid):
+        """Text-box question auto-graded against accepted answers (each full
+        marks). usecase=0 => case-insensitive; '*' wildcards allowed."""
+        lines = ['                <plugin_qtype_shortanswer_question>',
+                 '                  <answers>']
+        for acc in item["accepted"]:
+            lines += [f'                    <answer id="{aid}">',
+                      f'                      <answertext>{escape(acc)}</answertext>',
+                      '                      <answerformat>0</answerformat>',
+                      '                      <fraction>1.0000000</fraction>',
+                      '                      <feedback></feedback>',
+                      '                      <feedbackformat>1</feedbackformat>',
+                      '                    </answer>']
+            aid += 1
+        lines += [
+            '                  </answers>',
+            f'                  <shortanswer id="{inner_id}">',
+            '                    <usecase>0</usecase>',
+            '                  </shortanswer>',
+            '                </plugin_qtype_shortanswer_question>']
+        return '\n'.join(lines), aid
+
+    def _essay_plugin(self, inner_id):
+        return f"""                <plugin_qtype_essay_question>
+                  <essay id="{inner_id}">
                     <responseformat>editor</responseformat>
                     <responserequired>1</responserequired>
                     <responsefieldlines>25</responsefieldlines>
@@ -198,14 +279,56 @@ class MoodleBackupBuilder:
                     <filetypeslist>$@NULL@$</filetypeslist>
                     <maxbytes>0</maxbytes>
                   </essay>
-                </plugin_qtype_essay_question>
-                <question_hints></question_hints>
-                <tags></tags>
-              </question>
-            </questions>
-          </question_versions>
-        </question_version>
-      </question_bank_entry>"""
+                </plugin_qtype_essay_question>"""
+
+    def _render_item(self, item, qid, cat_id, aid):
+        """Dispatch one item to its qtype renderer. Returns (xml, new_aid)."""
+        qtype = item["qtype"]
+        inner_id = qid + 10000
+        if qtype == "multichoice":
+            q = item["q"]
+            plugin, aid = self._mc_plugin(q, inner_id, aid)
+            name = f"{q.get('topic', '')} - {q['question'][:60]}"
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=name, questiontext=q["question"],
+                qtype="multichoice", points=item["points"], plugin_xml=plugin,
+                penalty=0.3333333)
+        elif qtype == "gapselect":
+            plugin, aid = self._gapselect_plugin(item, inner_id, aid)
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="gapselect",
+                points=item["points"], plugin_xml=plugin,
+                generalfeedback=item.get("generalfeedback", ""))
+        elif qtype == "shortanswer":
+            plugin, aid = self._shortanswer_plugin(item, inner_id, aid)
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="shortanswer",
+                points=item["points"], plugin_xml=plugin,
+                generalfeedback=item.get("generalfeedback", ""))
+        elif qtype == "essay":
+            plugin = self._essay_plugin(inner_id)
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="essay",
+                points=item["points"], plugin_xml=plugin,
+                raw_text=item.get("raw_text", False))
+        elif qtype == "description":
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="description",
+                points=0.0, plugin_xml="", length=0,
+                raw_text=item.get("raw_text", False))
+        elif qtype == "coderunner":
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="coderunner",
+                points=item["points"], plugin_xml=item["plugin_xml"],
+                raw_text=item.get("raw_text", True))
+        else:
+            raise ValueError(f"Unknown qtype: {qtype}")
+        return xml, aid
 
     def _question_category_xml(self, cat_id, name, parent):
         return f"""  <question_category id="{cat_id}">
@@ -221,8 +344,8 @@ class MoodleBackupBuilder:
     <idnumber>$@NULL@$</idnumber>"""
 
     def _make_questions_xml(self):
-        """Build questions.xml. Tracks MC and essay entries separately
-        so the quiz can place all essays at the end."""
+        """Build questions.xml from section items (any qtype). Records an
+        ordered slot list the quiz layout consumes."""
         lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<question_categories>']
 
         lines.append(self._question_category_xml(self.Q_CAT_TOP, "top", 0))
@@ -232,8 +355,8 @@ class MoodleBackupBuilder:
 
         qid = 100
         aid = 5000
-        self._mc_slots = []   # [(entry_id, mc_points, section_name), ...]
-        self._essay_slots = []  # [(entry_id, essay_points, section_name), ...]
+        # slot record: dict(entry_id, points, section, qtype)
+        self._slots = []
         self._q_cat_ids = []
 
         for sec_idx, section in enumerate(self.sections):
@@ -244,18 +367,13 @@ class MoodleBackupBuilder:
             lines.append(self._question_category_xml(cat_id, cat_name, self.Q_CAT_TOP))
             lines.append('    <question_bank_entries>')
 
-            for q in section["mc_questions"]:
+            for item in section["items"]:
                 qid += 1
-                xml, aid = self._mc_question_xml(q, qid, cat_id, aid)
+                xml, aid = self._render_item(item, qid, cat_id, aid)
                 lines.append(xml)
-                self._mc_slots.append((qid, self.mc_points, section["name"]))
-
-            essay = section.get("essay")
-            if essay:
-                qid += 1
-                lines.append(self._essay_question_xml(
-                    essay["name"], essay["text"], qid, cat_id))
-                self._essay_slots.append((qid, self.essay_points, section["name"]))
+                self._slots.append({
+                    "entry_id": qid, "points": item["points"],
+                    "section": section["name"], "qtype": item["qtype"]})
 
             lines.append('    </question_bank_entries>')
             lines.append('  </question_category>')
@@ -274,10 +392,15 @@ class MoodleBackupBuilder:
         )
         lines.append(self._question_category_xml(comment_cat_id, "Comments", self.Q_CAT_TOP))
         lines.append('    <question_bank_entries>')
-        lines.append(self._essay_question_xml("Kommentarer / Comments", comment_text, qid, comment_cat_id, points=0))
+        comment_xml, _ = self._render_item(
+            {"qtype": "essay", "name": "Kommentarer / Comments",
+             "text": comment_text, "points": 0.0, "raw_text": False},
+            qid, comment_cat_id, aid)
+        lines.append(comment_xml)
         lines.append('    </question_bank_entries>')
         lines.append('  </question_category>')
-        self._comment_slot = (qid, 0.0, "Comments")
+        self._comment_slot = {"entry_id": qid, "points": 0.0,
+                              "section": "Comments", "qtype": "essay"}
 
         lines.append('</question_categories>')
         return '\n'.join(lines)
@@ -293,21 +416,32 @@ class MoodleBackupBuilder:
         SEB is enabled with client config, no download button.
         """
         MC_PER_PAGE = 5
-        # Review bit: 0x10 = AFTER_CLOSE only (nothing during attempt)
-        REVIEW_AFTER_CLOSE = 16
+        # Quiz review bitmask phases: DURING|IMMEDIATELY|OPEN(after attempt,
+        # while open)|CLOSED(after close).
+        REVIEW_AFTER_CLOSE = 16          # 0x10 = OPEN: after the attempt only
+        REVIEW_ALWAYS = 0x10000 | 0x1000 | 0x10 | 0x2  # incl. during the attempt
 
-        total_mc = len(self._mc_slots)
-        total_essays = len(self._essay_slots)
+        # Build the ordered slot list and each slot's quiz-section heading.
+        ordered_slots = []
+        if self.essays_last:
+            for s in (x for x in self._slots if x["qtype"] != "essay"):
+                ordered_slots.append({**s, "heading": s["section"]})
+            for s in (x for x in self._slots if x["qtype"] == "essay"):
+                ordered_slots.append({**s, "heading": "Essay Questions"})
+        else:
+            for s in self._slots:
+                ordered_slots.append({**s, "heading": s["section"]})
+        ordered_slots.append({**self._comment_slot,
+                              "heading": "Kommentarer / Comments"})
 
-        # Ordered slots: all MC, then all essays
-        ordered_slots = list(self._mc_slots) + list(self._essay_slots) + [self._comment_slot]
+        n_graded = sum(1 for s in self._slots if s["points"] > 0)
 
         lines = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             f'<activity id="{self.QUIZ_ACTIVITY_ID}" moduleid="{self.QUIZ_MODULE_ID}" modulename="quiz" contextid="{self.COURSE_CONTEXT_ID + 10}">',
             f'  <quiz id="{self.QUIZ_ACTIVITY_ID}">',
             f'    <name>{escape(self.title)}</name>',
-            f'    <intro>&lt;p&gt;{escape(self.title)}. {total_mc} MC ({self.mc_points:.0f}p each) + {total_essays} essays ({self.essay_points:.0f}p each). Total: {self.total_points:.0f}p.&lt;/p&gt;</intro>',
+            f'    <intro>&lt;p&gt;{escape(self.title)}. {n_graded} questions. Total: {self.total_points:.0f}p.&lt;/p&gt;</intro>',
             f'    <introformat>1</introformat>',
             f'    <timeopen>{self.time_open}</timeopen>',
             f'    <timeclose>{self.time_close}</timeclose>',
@@ -323,7 +457,7 @@ class MoodleBackupBuilder:
             f'    <questiondecimalpoints>-1</questiondecimalpoints>',
             f'    <reviewattempt>{REVIEW_AFTER_CLOSE}</reviewattempt>',
             f'    <reviewcorrectness>{REVIEW_AFTER_CLOSE}</reviewcorrectness>',
-            f'    <reviewmaxmarks>{REVIEW_AFTER_CLOSE}</reviewmaxmarks>',
+            f'    <reviewmaxmarks>{REVIEW_ALWAYS}</reviewmaxmarks>',
             f'    <reviewmarks>{REVIEW_AFTER_CLOSE}</reviewmarks>',
             f'    <reviewspecificfeedback>{REVIEW_AFTER_CLOSE}</reviewspecificfeedback>',
             f'    <reviewgeneralfeedback>{REVIEW_AFTER_CLOSE}</reviewgeneralfeedback>',
@@ -384,21 +518,29 @@ class MoodleBackupBuilder:
             f'    <question_instances>',
         ]
 
-        # Assign pages: MC grouped MC_PER_PAGE per page, essays 1 per page
+        # Assign pages: group up to GROUP_PER_PAGE items per page; start a new
+        # page at every section/heading boundary; coderunner gets its own page
+        # UNLESS it directly follows its info-block description(s) in the same
+        # section (then it shares their page, like the old exam: the Python
+        # list/string operation reference stays beside the programming task).
+        GROUP_PER_PAGE = MC_PER_PAGE
         page = 0
-        mc_on_current_page = 0
-        for slot_idx, (entry_id, maxmark, _sec_name) in enumerate(ordered_slots):
+        on_page = 0
+        prev_heading = None
+        for slot_idx, s in enumerate(ordered_slots):
             slot = slot_idx + 1
-            is_mc = maxmark == self.mc_points
-
-            if not is_mc:
+            new_section = s["heading"] != prev_heading
+            prev = ordered_slots[slot_idx - 1] if slot_idx else None
+            follows_own_info = (prev is not None
+                                and prev["qtype"] == "description"
+                                and prev["heading"] == s["heading"])
+            alone = s["qtype"] == "coderunner" and not follows_own_info
+            if new_section or alone or on_page >= GROUP_PER_PAGE or page == 0:
                 page += 1
-                mc_on_current_page = 0
-            elif mc_on_current_page >= MC_PER_PAGE or mc_on_current_page == 0:
-                page += 1
-                mc_on_current_page = 1
+                on_page = 1
             else:
-                mc_on_current_page += 1
+                on_page += 1
+            prev_heading = s["heading"]
 
             lines.append(f'      <question_instance id="{1000 + slot}">')
             lines.append(f'        <quizid>{self.QUIZ_ACTIVITY_ID}</quizid>')
@@ -406,71 +548,55 @@ class MoodleBackupBuilder:
             lines.append(f'        <page>{page}</page>')
             lines.append(f'        <displaynumber>$@NULL@$</displaynumber>')
             lines.append(f'        <requireprevious>0</requireprevious>')
-            lines.append(f'        <maxmark>{maxmark:.7f}</maxmark>')
+            lines.append(f'        <maxmark>{s["points"]:.7f}</maxmark>')
             lines.append(f'        <quizgradeitemid>$@NULL@$</quizgradeitemid>')
             lines.append(f'        <question_reference id="{2000 + slot}">')
             lines.append(f'          <usingcontextid>{self.COURSE_CONTEXT_ID + 10}</usingcontextid>')
             lines.append(f'          <component>mod_quiz</component>')
             lines.append(f'          <questionarea>slot</questionarea>')
-            lines.append(f'          <questionbankentryid>{entry_id}</questionbankentryid>')
+            lines.append(f'          <questionbankentryid>{s["entry_id"]}</questionbankentryid>')
             lines.append(f'          <version>$@NULL@$</version>')
             lines.append(f'        </question_reference>')
             lines.append(f'      </question_instance>')
 
         lines.append(f'    </question_instances>')
 
-        # Quiz section headings: one per section's MC, then one "Essays" section
+        # Quiz section headings: one per consecutive run of equal heading.
         lines.append(f'    <sections>')
         sec_id = 0
-        slot_cursor = 1
-
-        # Group MC by section name (preserving order)
-        seen_sections = []
-        section_mc_counts = {}
-        for _, _, sec_name in self._mc_slots:
-            if sec_name not in section_mc_counts:
-                seen_sections.append(sec_name)
-                section_mc_counts[sec_name] = 0
-            section_mc_counts[sec_name] += 1
-
-        for sec_name in seen_sections:
-            sec_id += 1
-            lines.append(f'      <section id="{sec_id}"><firstslot>{slot_cursor}</firstslot>'
-                         f'<heading>{escape(sec_name)}</heading>'
-                         f'<shufflequestions>0</shufflequestions></section>')
-            slot_cursor += section_mc_counts[sec_name]
-
-        if self._essay_slots:
-            sec_id += 1
-            lines.append(f'      <section id="{sec_id}"><firstslot>{slot_cursor}</firstslot>'
-                         f'<heading>Essay Questions</heading>'
-                         f'<shufflequestions>0</shufflequestions></section>')
-            slot_cursor += len(self._essay_slots)
-
-        # Comment box section
-        sec_id += 1
-        lines.append(f'      <section id="{sec_id}"><firstslot>{slot_cursor}</firstslot>'
-                     f'<heading>Kommentarer / Comments</heading>'
-                     f'<shufflequestions>0</shufflequestions></section>')
+        prev_heading = None
+        for slot_idx, s in enumerate(ordered_slots):
+            if s["heading"] != prev_heading:
+                sec_id += 1
+                lines.append(
+                    f'      <section id="{sec_id}"><firstslot>{slot_idx + 1}</firstslot>'
+                    f'<heading>{escape(s["heading"])}</heading>'
+                    f'<shufflequestions>0</shufflequestions></section>')
+                prev_heading = s["heading"]
 
         lines.append(f'    </sections>')
 
-        # Grade feedback boundaries
+        # Grade feedback boundaries. The old IDSV exam embedded none (criteria
+        # stated only in the info label); PVT15 shows a preliminary grade.
         lines.append(f'    <feedbacks>')
-        boundaries = [
-            (90.0, 100.01, "Preliminary grade: A"),
-            (80.0, 90.0, "Preliminary grade: B"),
-            (70.0, 80.0, "Preliminary grade: C"),
-            (60.0, 70.0, "Preliminary grade: D"),
-            (50.0, 60.0, "Preliminary grade: E"),
-            (0.0, 50.0, "Preliminary grade: F"),
-        ]
-        for fid, (lo, hi, text) in enumerate(boundaries, 1):
-            lines.append(f'      <feedback id="{fid}">')
-            lines.append(f'        <feedbacktext>{escape(text)}</feedbacktext>')
+        if self.embed_grade_feedback:
+            ladder = list(self.grade_letters)  # (letter, min_pts), high->low
+            fid = 0
+            for i, (letter, lo) in enumerate(ladder):
+                fid += 1
+                hi = ladder[i - 1][1] if i > 0 else self.total_points + 0.01
+                lines.append(f'      <feedback id="{fid}">')
+                lines.append(f'        <feedbacktext>Preliminary grade: {escape(letter)}</feedbacktext>')
+                lines.append(f'        <feedbacktextformat>1</feedbacktextformat>')
+                lines.append(f'        <mingrade>{lo:.5f}</mingrade>')
+                lines.append(f'        <maxgrade>{hi:.5f}</maxgrade>')
+                lines.append(f'      </feedback>')
+        else:
+            lines.append(f'      <feedback id="1">')
+            lines.append(f'        <feedbacktext></feedbacktext>')
             lines.append(f'        <feedbacktextformat>1</feedbacktextformat>')
-            lines.append(f'        <mingrade>{self.total_points * lo / 100:.5f}</mingrade>')
-            lines.append(f'        <maxgrade>{self.total_points * hi / 100:.5f}</maxgrade>')
+            lines.append(f'        <mingrade>0.00000</mingrade>')
+            lines.append(f'        <maxgrade>{self.total_points + 1:.5f}</maxgrade>')
             lines.append(f'      </feedback>')
         lines.append(f'    </feedbacks>')
 
@@ -484,24 +610,36 @@ class MoodleBackupBuilder:
     # -- labels --------------------------------------------------------------
 
     def _make_label_xml(self):
-        total_mc = sum(len(s["mc_questions"]) for s in self.sections)
-        total_essays = sum(1 for s in self.sections if s.get("essay"))
-        total_mc_pts = total_mc * self.mc_points
-
-        # Build section breakdown
-        breakdown = ""
+        from collections import Counter, defaultdict
+        qn = Counter()
+        qpts = defaultdict(float)
         for section in self.sections:
-            mc_count = len(section["mc_questions"])
-            breakdown += f"&lt;li&gt;{mc_count} multiple choice on {escape(section['name'])} ({self.mc_points:.0f}p each)&lt;/li&gt;"
-            if section.get("essay"):
-                breakdown += f"&lt;li&gt;1 essay on {escape(section['name'])} ({self.essay_points:.0f}p)&lt;/li&gt;"
+            for it in section["items"]:
+                if it["qtype"] == "description":
+                    continue
+                qn[it["qtype"]] += 1
+                qpts[it["qtype"]] += it["points"]
+        total_essays = qn.get("essay", 0)
+        # Auto-graded = everything that isn't a manually-marked essay.
+        total_auto_pts = sum(v for t, v in qpts.items() if t != "essay")
 
-        # Grade table
+        qlabels = {
+            "gapselect": "rullgardinsfrågor / dropdown questions",
+            "shortanswer": "kortsvarsfrågor / short-answer questions",
+            "multichoice": "flervalsfrågor / multiple choice",
+            "essay": "essäfrågor / essay questions",
+            "coderunner": "programmeringsfråga / programming question",
+        }
+        breakdown = ""
+        for t in ("gapselect", "shortanswer", "multichoice", "coderunner", "essay"):
+            if qn.get(t):
+                breakdown += (f"&lt;li&gt;{qn[t]} {qlabels[t]} "
+                              f"({qpts[t]:.0f}p)&lt;/li&gt;")
+
+        # Grade table — absolute point thresholds (IDSV: A 34, B 32, ...).
         grade_rows = ""
-        for pct, letter in GRADE_LETTERS:
-            if pct > 0:
-                pts = self.total_points * pct / 100
-                grade_rows += f"&lt;br&gt;{letter} – {pts:.0f} poäng / points,"
+        for letter, pts in self.grade_letters:
+            grade_rows += f"&lt;br&gt;{letter} – {pts:.0f} poäng / points,"
         grade_rows = grade_rows.rstrip(",")
 
         info = (
@@ -549,12 +687,15 @@ class MoodleBackupBuilder:
             f"&lt;p&gt;Maxpoäng / Maximum points: {self.total_points:.0f}&lt;/p&gt;"
             f"&lt;p&gt;Minimipoäng för de olika betygen / Minimum points for each grade:"
             f"{grade_rows}&lt;/p&gt;"
-            f"&lt;p&gt;&lt;strong&gt;Totalt kan {total_mc_pts:.0f}p erhållas på flervalsfrågorna. "
-            f"För betyg högre än D ({self.total_points * 0.6:.0f}p) krävs poäng på båda essäfrågorna.&lt;/strong&gt;&lt;/p&gt;"
-            f"&lt;p&gt;&lt;strong&gt;&lt;em&gt;A total of {total_mc_pts:.0f}p can be earned from multiple choice questions. "
-            f"To achieve a grade higher than D ({self.total_points * 0.6:.0f}p), "
-            f"points on both essay questions are required.&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;"
         )
+        if self.programming_min_points:
+            pm = self.programming_min_points
+            info += (
+                f"&lt;p&gt;&lt;strong&gt;För samtliga betyg ovan krävs minst {pm:.0f} poäng "
+                f"på programmeringsuppgiften.&lt;/strong&gt;&lt;/p&gt;"
+                f"&lt;p&gt;&lt;strong&gt;&lt;em&gt;For all grades above, at least {pm:.0f} points "
+                f"on the programming task are required.&lt;/em&gt;&lt;/strong&gt;&lt;/p&gt;"
+            )
 
         # Section minimum requirements
         sections_with_min = [s for s in self.sections if s.get("min_points")]
@@ -753,7 +894,7 @@ class MoodleBackupBuilder:
       <grademin>0.00000</grademin>
       <scaleid>$@NULL@$</scaleid>
       <outcomeid>$@NULL@$</outcomeid>
-      <gradepass>{self.total_points * 0.5:.5f}</gradepass>
+      <gradepass>{self.grade_pass:.5f}</gradepass>
       <multfactor>1.00000</multfactor>
       <plusfactor>0.00000</plusfactor>
       <aggregationcoef>0.00000</aggregationcoef>
@@ -898,7 +1039,7 @@ class MoodleBackupBuilder:
             f'      <grademin>0.00000</grademin>',
             f'      <scaleid>$@NULL@$</scaleid>',
             f'      <outcomeid>$@NULL@$</outcomeid>',
-            f'      <gradepass>{self.total_points * 0.5:.5f}</gradepass>',
+            f'      <gradepass>{self.grade_pass:.5f}</gradepass>',
             f'      <multfactor>1.00000</multfactor>',
             f'      <plusfactor>0.00000</plusfactor>',
             f'      <aggregationcoef>0.00000</aggregationcoef>',
@@ -918,11 +1059,15 @@ class MoodleBackupBuilder:
             '  </grade_items>',
             '  <grade_letters>',
         ]
-        for lid, (boundary, letter) in enumerate(GRADE_LETTERS, 1):
-            lines.append(f'    <grade_letter id="{lid}">')
-            lines.append(f'      <lowerboundary>{boundary:.5f}</lowerboundary>')
-            lines.append(f'      <letter>{letter}</letter>')
-            lines.append(f'    </grade_letter>')
+        # grade_letters use percentage lowerboundaries. The old IDSV exam set
+        # none (criteria only in the label); only emit when embedding.
+        if self.embed_grade_feedback:
+            tp = self.total_points or 1
+            for lid, (letter, pts) in enumerate(self.grade_letters, 1):
+                lines.append(f'    <grade_letter id="{lid}">')
+                lines.append(f'      <lowerboundary>{pts / tp * 100:.5f}</lowerboundary>')
+                lines.append(f'      <letter>{letter}</letter>')
+                lines.append(f'    </grade_letter>')
         lines.extend([
             '  </grade_letters>',
             '  <grade_settings>',
