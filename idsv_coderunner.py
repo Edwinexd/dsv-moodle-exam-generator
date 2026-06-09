@@ -26,13 +26,21 @@ def extract_coderunner(mbz_path):
     with tarfile.open(mbz_path, "r:gz") as tar:
         xml = tar.extractfile("questions.xml").read().decode("utf-8")
 
-    # Each <question ...> that is a coderunner; take the last (latest version).
-    blocks = [m for m in re.finditer(
+    # Each <question ...> that is a coderunner. A full-course export keeps every
+    # version of the question, and they are NOT in version order in the file
+    # (the newest can come first), so pick the one with the latest <timemodified>
+    # rather than the last in file order.
+    blocks = [m.group(1) for m in re.finditer(
         r"<question id=\"\d+\">(.*?)</question>", xml, re.S)
         if "<qtype>coderunner</qtype>" in m.group(1)]
     if not blocks:
         raise SystemExit("No coderunner question found in " + mbz_path)
-    body = blocks[-1].group(1)
+
+    def _timemodified(b):
+        m = re.search(r"<timemodified>(\d+)</timemodified>", b)
+        return int(m.group(1)) if m else -1
+
+    body = max(blocks, key=_timemodified)
 
     name = re.search(r"<name>(.*?)</name>", body, re.S).group(1)
     text = re.search(r"<questiontext>(.*?)</questiontext>", body, re.S).group(1)

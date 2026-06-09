@@ -33,6 +33,9 @@ old exam). `programming_min_points` adds the "≥N p on the programming task" no
 Pass mark = lowest non-F/FX threshold. **`reviewmaxmarks` always includes the
 during-attempt bit** so the available marks per question are visible while sitting
 the exam (the achieved score still follows the after-close review setting).
+`answer_guidance` (optional `(sv, en)` tuple, default None) inserts a note in the
+info label just before the "a question score can never go below 0" line — used by
+IDSV for "answers must be short and concise…"; other exams leave it None.
 
 `gapselect` items honour a `shuffle` flag (default True); numeric dropdowns whose
 answer ranges over a small fixed space (hex byte, 8-bit binary) list every value
@@ -63,6 +66,9 @@ Pieces (all single-pass, no DB):
   precede it (`prog_info_items`: list + string operation cheat-sheets, raw-HTML
   assets `courses/idsv_prog_lists.html` / `idsv_prog_strings.html`, mirroring the
   old exam). `build_idsv.py` prepends them when a plan entry sets `coderunner`.
+  `extract_coderunner` picks the version with the latest `<timemodified>` (a
+  full-course export stores every version and NOT in version order — the newest
+  can come first, so file order is unreliable).
 - `scripts/extract_pool.py` — (re)extract the glossary pool from an old `.mbz`.
 - `courses/idsv.json` — config: paths (incl. `prog_info_lists`/`prog_info_strings`),
   points, and the per-chapter plan.

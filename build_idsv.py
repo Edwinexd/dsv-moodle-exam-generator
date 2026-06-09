@@ -124,7 +124,8 @@ def main():
         essays_last=False,
         grade_letters=[(l, p) for l, p in cfg["grade_letters"]] if cfg.get("grade_letters") else None,
         embed_grade_feedback=cfg.get("embed_grade_feedback", True),
-        programming_min_points=cfg.get("programming_min_points"))
+        programming_min_points=cfg.get("programming_min_points"),
+        answer_guidance=cfg.get("answer_guidance"))
     builder.build(output)
 
     # Report

@@ -60,7 +60,7 @@ class MoodleBackupBuilder:
                  contact_name="Edwin", contact_email="edwinsu@dsv.su.se",
                  include_qa_forum=True, essays_last=True,
                  grade_letters=None, embed_grade_feedback=True,
-                 programming_min_points=None, now=None):
+                 programming_min_points=None, answer_guidance=None, now=None):
         self.title = title
         self.time_open = time_open
         self.time_close = time_close
@@ -90,6 +90,10 @@ class MoodleBackupBuilder:
         self.grade_letters = grade_letters
         self.embed_grade_feedback = embed_grade_feedback
         self.programming_min_points = programming_min_points
+        # Optional (sv, en) note shown in the info label just before the
+        # "a question score can never go below 0" line. IDSV-only (e.g. answers
+        # must be short and concise); other exams leave it None.
+        self.answer_guidance = answer_guidance
         # Lowest passing mark = the lowest non-failing letter's threshold.
         passing = [m for l, m in grade_letters if l not in ("F", "FX")]
         self.grade_pass = min(passing) if passing else 0.0
@@ -679,6 +683,14 @@ class MoodleBackupBuilder:
             f"&lt;h3&gt;Poängfördelning / Point distribution&lt;/h3&gt;"
             f"&lt;p&gt;This exam contains:&lt;/p&gt;&lt;ul&gt;{breakdown}&lt;/ul&gt;"
             f"&lt;p&gt;&lt;strong&gt;Total: {self.total_points:.0f} points&lt;/strong&gt;&lt;/p&gt;"
+        )
+        if self.answer_guidance:
+            sv, en = self.answer_guidance
+            info += (
+                f"&lt;p&gt;{escape(sv)}&lt;/p&gt;"
+                f"&lt;p&gt;&lt;em&gt;{escape(en)}&lt;/em&gt;&lt;/p&gt;"
+            )
+        info += (
             f"&lt;p&gt;Delvis rätt svar ger delpoäng. Poängen på en fråga kan aldrig bli lägre än 0.&lt;/p&gt;"
             f"&lt;p&gt;&lt;em&gt;Partially correct answers give partial credit. "
             f"A question score can never go below 0.&lt;/em&gt;&lt;/p&gt;"
