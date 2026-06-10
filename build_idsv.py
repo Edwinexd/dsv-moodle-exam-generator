@@ -4,7 +4,7 @@ Build the IDSV resit (uppsamling) exam .mbz.
 
 Single-pass assembly:
   - questions picked from the idsv-old-exams CSV, converted to unified dropdowns
-    (glossary pool from the old mbz for terms; generated distractors for numbers),
+    (glossary pool from the old mbz for terms; full value-space for numbers),
   - Generative-AI questions kept as freetext essays,
   - machine-language section (ISA + config descriptions + R3/R1/PC dropdowns),
   - the new CodeRunner programming question lifted from the course-452 mbz.
@@ -17,11 +17,12 @@ import argparse
 import json
 import random
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import idsv_questions as iq
 import idsv_machine as im
-import idsv_coderunner as icr
+from mbz_extract import extract_question
 from moodle_backup_builder import MoodleBackupBuilder
 
 # Exam times are given in Stockholm local time (matches the iexam export).
@@ -38,6 +39,7 @@ def build_sections(cfg, rng):
     pool = json.load(open(cfg["pool"]))["options"]
     dp = cfg.get("dropdown_points", 1.0)
     ep = cfg.get("essay_points", 1.0)
+    overrides = cfg.get("overrides", {})  # per-question patches, keyed by CSV id
     used = set()       # CSV ids already picked
     used_answers = set()  # correct answers already used (no concept/value repeats)
     sections = []
@@ -57,7 +59,8 @@ def build_sections(cfg, rng):
         if spec.get("dropdowns"):
             picks = iq.select_dropdowns(
                 rows, spec["chapter"], spec["dropdowns"], rng, pool,
-                points=dp, exclude_ids=used, exclude_answers=used_answers)
+                points=dp, exclude_ids=used, exclude_answers=used_answers,
+                overrides=overrides)
             for d in picks:
                 used.add(d["source_id"])
             items.extend(picks)
@@ -85,12 +88,24 @@ def build_sections(cfg, rng):
                 used.add(e["source_id"])
             items.extend(picks)
 
+        # Reference info blocks (raw-HTML assets) rendered as descriptions;
+        # placed just before the coderunner so they share its page.
+        for blk in spec.get("info_html", []):
+            items.append({"qtype": "description", "name": blk["name"],
+                          "text": Path(blk["html"]).read_text(encoding="utf-8")})
+
         if spec.get("coderunner"):
-            items.extend(icr.prog_info_items(
-                cfg["prog_info_lists"], cfg["prog_info_strings"]))
-            items.append(icr.extract_coderunner(cfg["coderunner_mbz"]))
+            items.append(extract_question(cfg["coderunner_mbz"], "coderunner"))
 
         sections.append({"name": spec["name"], "items": items})
+
+    # Per-question overrides only take effect if that question was drawn; warn
+    # loudly if any went unused (e.g. the seed changed and it wasn't picked).
+    unused = set(overrides) - used
+    if unused:
+        raise SystemExit(
+            f"Overrides for ids {sorted(unused)} were not applied — those "
+            f"questions weren't selected (seed/selection changed?).")
     return sections
 
 

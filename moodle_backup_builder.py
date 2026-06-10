@@ -289,7 +289,20 @@ class MoodleBackupBuilder:
         """Dispatch one item to its qtype renderer. Returns (xml, new_aid)."""
         qtype = item["qtype"]
         inner_id = qid + 10000
-        if qtype == "multichoice":
+        if "plugin_xml" in item:
+            # Lifted verbatim from an export (mbz_extract.extract_question):
+            # the plugin block is reused untouched and text/feedback arrive
+            # pre-escaped, whatever the qtype (coderunner, …).
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype=qtype,
+                points=item["points"], plugin_xml=item["plugin_xml"],
+                penalty=item.get("penalty", 0.0),
+                generalfeedback=item.get("generalfeedback", ""),
+                length=0 if qtype == "description" else 1,
+                raw_text=item.get("raw_text", True),
+                raw_feedback=item.get("raw_feedback", True))
+        elif qtype == "multichoice":
             q = item["q"]
             plugin, aid = self._mc_plugin(q, inner_id, aid)
             name = f"{q.get('topic', '')} - {q['question'][:60]}"
@@ -324,12 +337,6 @@ class MoodleBackupBuilder:
                 questiontext=item["text"], qtype="description",
                 points=0.0, plugin_xml="", length=0,
                 raw_text=item.get("raw_text", False))
-        elif qtype == "coderunner":
-            xml = self._render_entry(
-                qid=qid, cat_id=cat_id, name=item["name"],
-                questiontext=item["text"], qtype="coderunner",
-                points=item["points"], plugin_xml=item["plugin_xml"],
-                raw_text=item.get("raw_text", True))
         else:
             raise ValueError(f"Unknown qtype: {qtype}")
         return xml, aid

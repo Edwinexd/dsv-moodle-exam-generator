@@ -11,7 +11,6 @@ Item dicts (consumed by MoodleBackupBuilder):
     {"qtype": "essay", "name", "text", "points", "source_id"}
 """
 import csv
-import random
 import re
 
 # Dropdown instruction shown under every converted question (matches old exam).
@@ -19,7 +18,7 @@ PICK_INSTRUCTION = (
     "<hr><p><em>Välj ditt svar med rullgardinsmenyn ovan! "
     "Pick your answer using the drop down menu above!</em></p>")
 
-# Subjects whose answers are numeric/bit-pattern (-> generated numeric distractors).
+# Subjects whose answers are numeric/bit-pattern (-> full value-space dropdown).
 NUMERIC_SUBJECTS = {"BIN", "HEX", "TWO", "COL", "HER", "FLO", "REG", "PRC", "INR"}
 
 
@@ -86,44 +85,6 @@ def numeric_options(answer):
     return None
 
 
-# ---- numeric distractor generation ---------------------------------------
-
-def _numeric_distractors(answer, rng, n=6):
-    """Plausible wrong values that share the answer's shape (bits/hex/decimal)."""
-    a = _norm_answer(answer)
-    out = []
-    seen = {a}
-
-    def add(v):
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-
-    bits_only = bool(re.fullmatch(r"[01 ]+", a))
-    hex_only = bool(re.fullmatch(r"[0-9A-Fa-f ]+", a))
-
-    attempts = 0
-    while len(out) < n and attempts < 200:
-        attempts += 1
-        chars = list(a)
-        positions = [i for i, c in enumerate(chars) if c != " "]
-        if not positions:
-            break
-        # flip 1-2 symbols
-        for _ in range(rng.randint(1, 2)):
-            i = rng.choice(positions)
-            if bits_only:
-                chars[i] = "1" if chars[i] == "0" else "0"
-            elif hex_only:
-                d = "0123456789ABCDEF"
-                cur = chars[i].upper()
-                chars[i] = rng.choice([x for x in d if x != cur])
-            else:
-                chars[i] = str(rng.randint(0, 9))
-        add("".join(chars))
-    return out[:n]
-
-
 # ---- eligibility ---------------------------------------------------------
 #
 # A question only becomes a dropdown if its answer fits one of the two formats
@@ -169,24 +130,46 @@ def correct_answer(row, pool_canon):
 
 # ---- conversion ----------------------------------------------------------
 
-def row_to_dropdown(row, glossary_pool, pool_canon, rng, points=1.0):
-    """Convert an *eligible* CSV row into a gapselect (dropdown) item."""
+def english_sort_key(opt):
+    """Sort key for a glossary option: the English term — the trailing
+    parenthetical of a 'Swedish (English)' entry, else the whole option. The
+    English term is the well-known one, so the menus are ordered by it."""
+    m = re.search(r"\(([^()]*)\)\s*$", opt)
+    return (m.group(1) if m else opt).strip().lower()
+
+
+def row_to_dropdown(row, glossary_pool, pool_canon, rng, points=1.0, override=None):
+    """Convert an *eligible* CSV row into a gapselect (dropdown) item.
+
+    `override` (optional, keyed by CSV id in the config) patches a single
+    question: `{"answer": <text replacing the correct option>,
+    "text_sub": [[regex, repl], ...]}`."""
+    override = override or {}
     num = numeric_options(_answer_raw(row))
     if num is not None:
         options, shuffle = num            # full sorted value space, no shuffle
         correct = _answer_raw(row).upper()
     else:
-        # glossary concept term: correct answer is a real pool entry
+        # glossary concept term: correct answer is a real pool entry.
         correct = pool_canon[combine(row.get("ans_se"), row.get("ans_en")).lower()]
         options = list(glossary_pool)
-        shuffle = True
-
-    if shuffle:
+        if override.get("answer"):         # patch the correct option's text
+            options[options.index(correct)] = override["answer"]
+            correct = override["answer"]
+        # Consume the same rng as the old shuffling path so the question *draw*
+        # stays identical across builds, then order the menu alphabetically by
+        # the English term (display only).
         rng.shuffle(options)
+        options.sort(key=english_sort_key)
+        shuffle = False                     # ordered menu, no shuffle
+
     answer_index = options.index(correct) + 1  # 1-based, used as [[N]]
 
+    body = bilingual_text(row)
+    for pat, repl in override.get("text_sub", []):
+        body = re.sub(pat, repl, body)
     name = f"Q{_clean(row.get('id'))} - {_clean(row.get('subject')) or 'IDSV'}"
-    text = bilingual_text(row) + f"\n<p>[[{answer_index}]]</p>" + PICK_INSTRUCTION
+    text = body + f"\n<p>[[{answer_index}]]</p>" + PICK_INSTRUCTION
     gf = f"<p><strong>Förväntat svar / Expected answer:</strong> {correct}</p>"
     return {
         "qtype": "gapselect",
@@ -215,10 +198,12 @@ def row_to_essay(row, points=1.0):
 # ---- selection -----------------------------------------------------------
 
 def select_dropdowns(rows, chapter, count, rng, glossary_pool, points=1.0,
-                     exclude_ids=(), exclude_answers=None):
+                     exclude_ids=(), exclude_answers=None, overrides=None):
     """Pick `count` dropdown-eligible rows from `chapter` and convert them.
     `exclude_answers` (a set) prevents the same correct answer recurring across
-    the exam; picked answers are added to it."""
+    the exam; picked answers are added to it. `overrides` maps a CSV id to a
+    per-question patch (see `row_to_dropdown`)."""
+    overrides = overrides or {}
     pool_lower = {p.lower() for p in glossary_pool}
     pool_canon = {p.lower(): p for p in glossary_pool}
     seen = exclude_answers if exclude_answers is not None else set()
@@ -235,7 +220,8 @@ def select_dropdowns(rows, chapter, count, rng, glossary_pool, points=1.0,
         if ans in seen:
             continue
         seen.add(ans)
-        picked.append(row_to_dropdown(r, glossary_pool, pool_canon, rng, points))
+        picked.append(row_to_dropdown(r, glossary_pool, pool_canon, rng, points,
+                                      override=overrides.get(_clean(r.get("id")))))
     if len(picked) < count:
         raise SystemExit(
             f"Chapter {chapter}: only {len(picked)} distinct dropdown-eligible "

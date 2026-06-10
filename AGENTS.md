@@ -17,7 +17,13 @@ Question model is a generic **item** list per section. Each item has a `qtype`:
 - `gapselect` — unified dropdown: `{"name","text","options"[],"answer_index","generalfeedback","points"}`. The text must contain `[[N]]` where N == `answer_index` (1-based index into `options`); fraction is unused, all options share group 1.
 - `essay` — `{"name","text","points","raw_text"?}`
 - `description` — `{"name","text"}` (0p, no plugin block)
-- `coderunner` — `{"name","text","plugin_xml","points","raw_text":True}` (plugin block reused verbatim from an export)
+- **verbatim** (any qtype, e.g. `coderunner`) — an item carrying a `plugin_xml`
+  key bypasses the per-qtype renderers: the plugin block is reused untouched and
+  `text`/`generalfeedback` arrive pre-escaped (`raw_text`/`raw_feedback` default
+  True). Produced by `mbz_extract.extract_question(mbz, qtype, name=None)`, which
+  lifts a question verbatim from an exported `.mbz` and picks the version with
+  the latest `<timemodified>` (a full-course export stores every version and NOT
+  in version order — the newest can come first, so file order is unreliable).
 
 Back-compat: a section with the old `mc_questions`/`essay` keys is auto-normalised
 to items. `essays_last=True` (default) groups all essays after the MC (PVT15
@@ -39,7 +45,12 @@ IDSV for "answers must be short and concise…"; other exams leave it None.
 
 `gapselect` items honour a `shuffle` flag (default True); numeric dropdowns whose
 answer ranges over a small fixed space (hex byte, 8-bit binary) list every value
-sorted with shuffle off — see `idsv_questions.numeric_options`.
+sorted with shuffle off — see `idsv_questions.numeric_options`. Glossary term
+dropdowns are sorted alphabetically by the English term (`english_sort_key`:
+the trailing parenthetical of "Svenska (English)") with shuffle off. **RNG
+determinism:** the old per-question `rng.shuffle` is kept before the sort so the
+question *draw* stays identical across builds — do not remove it or the
+selection shifts.
 
 **Pagination.** Up to `MC_PER_PAGE` (5) items per page, new page at every
 section/heading boundary. A `coderunner` normally gets its own page, **except**
@@ -55,23 +66,26 @@ python build_idsv.py --date YYYY-MM-DD --start HH:MM --end HH:MM \
 Pieces (all single-pass, no DB):
 - `idsv_questions.py` — CSV → dropdown/essay items. `sa`/`sc`/short "essay" rows
   become dropdowns; term answers use the shared glossary pool, numeric answers
-  get generated distractors, `sc` uses its own `ans_alt_*`. Long answers → essays.
+  list their full fixed value space, `sc` uses its own `ans_alt_*`. Long answers
+  → essays. Config `overrides` (keyed by CSV id) patch a single drawn question:
+  `answer` replaces the correct option's text, `text_sub` applies
+  `[[regex, repl], …]` to the question body; the build errors if an override id
+  wasn't drawn (seed/selection changed).
 - `idsv_machine.py` — machine-language section: static ISA description
   (`courses/idsv_machine_isa.html`, reused verbatim) + config description (memory
   /register tables) + one numeric dropdown per asked value (R3/R1/PC). Reads the
   generated artifacts in the exam working folder; answers come from the answer-key
   file (machine/ toolkit, seed in the key).
-- `idsv_coderunner.py` — lifts the new CodeRunner question from an exported `.mbz`
-  (`extract_coderunner`), and emits the two Python-reference info blocks that
-  precede it (`prog_info_items`: list + string operation cheat-sheets, raw-HTML
-  assets `courses/idsv_prog_lists.html` / `idsv_prog_strings.html`, mirroring the
-  old exam). `build_idsv.py` prepends them when a plan entry sets `coderunner`.
-  `extract_coderunner` picks the version with the latest `<timemodified>` (a
-  full-course export stores every version and NOT in version order — the newest
-  can come first, so file order is unreliable).
+- `mbz_extract.py` — generic, lifts any question verbatim from an exported
+  `.mbz` (see the verbatim item above). `build_idsv.py` uses it for the new
+  CodeRunner question (`coderunner_mbz` config path) when a plan entry sets
+  `coderunner`. A plan entry's `info_html` (`[{"name", "html"}, …]`) emits
+  raw-HTML description blocks before it — the Programmering section uses it for
+  the two Python-reference cheat-sheets (`courses/idsv_prog_lists.html` /
+  `idsv_prog_strings.html`, mirroring the old exam).
 - `scripts/extract_pool.py` — (re)extract the glossary pool from an old `.mbz`.
-- `courses/idsv.json` — config: paths (incl. `prog_info_lists`/`prog_info_strings`),
-  points, and the per-chapter plan.
+- `courses/idsv.json` — config: paths, points, `overrides`, and the per-chapter
+  plan.
 
 Config paths currently point at `~/idsv-old-exams` (CSV) and the exam working
 folder `~/Downloads/iexam-dsv-uppsamling` (machine artifacts, course-452 mbz).
