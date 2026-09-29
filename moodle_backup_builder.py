@@ -4,6 +4,8 @@ Core Moodle .mbz backup builder.
 Generates a complete Moodle backup archive from a list of exam sections,
 each containing MC questions and an optional essay question.
 """
+import hashlib
+import mimetypes
 import tarfile
 import time
 from html import escape
@@ -55,12 +57,22 @@ class MoodleBackupBuilder:
     GRADE_ITEM_COURSE_ID = 1
     Q_CAT_TOP = 1
 
+    DEFAULT_COMMENT_TEXT = (
+        "I den här rutan kan ni lämna kommentarer för uppgifter på tentan. "
+        "Om ni har en kommentar för någon uppgift, skriv då först uppgiftsnumret "
+        "och sedan kommentaren.\n\n"
+        "In this box you can leave comments for tasks on the exam. "
+        "If you have a comment for a question, write the question number first "
+        "and then the comment."
+    )
+
     def __init__(self, *, title, time_open, time_close, timelimit,
                  mc_points, essay_points, sections,
                  contact_name="Edwin", contact_email="edwinsu@dsv.su.se",
                  include_qa_forum=True, essays_last=True,
                  grade_letters=None, embed_grade_feedback=True,
-                 programming_min_points=None, answer_guidance=None, now=None):
+                 programming_min_points=None, answer_guidance=None,
+                 comment_boxes=None, comment_intro=None, now=None):
         self.title = title
         self.time_open = time_open
         self.time_close = time_close
@@ -74,6 +86,11 @@ class MoodleBackupBuilder:
         # questions in section order (set essays_last=False).
         self.essays_last = essays_last
         self.now = now or int(time.time())
+
+        # Images referenced by question text, registered while rendering:
+        # {itemid: [(filename, Path), ...]}. Emitted into files.xml and stored
+        # in the archive under files/<hash[:2]>/<hash> (Moodle's layout).
+        self._question_files = {}
 
         self.sections = [self._normalize_section(s) for s in sections]
         self.total_points = sum(
@@ -94,9 +111,90 @@ class MoodleBackupBuilder:
         # "a question score can never go below 0" line. IDSV-only (e.g. answers
         # must be short and concise); other exams leave it None.
         self.answer_guidance = answer_guidance
+        # Free-text comment boxes (0 p, legal requirement). Default: one box at
+        # the very end of the quiz (PVT15). An exam split into graded areas
+        # passes one box per area, each placed after that area's last section
+        # (IDSV: theory / programming / Vetenskaplighet).
+        self.comment_boxes = [
+            {"heading": b.get("heading", "Kommentarer / Comments"),
+             "name": b.get("name", "Kommentarer / Comments"),
+             "category": b.get("category", "Comments"),
+             "text": b.get("text", self.DEFAULT_COMMENT_TEXT),
+             "after_section": b.get("after_section"),
+             # short label for the up-front "which box" instructions
+             "area_sv": b.get("area_sv", b.get("heading", "")),
+             "area_en": b.get("area_en", b.get("heading", "")),
+             # keep the box on its own area's page instead of starting a new
+             # quiz section (a section always begins a page in Moodle)
+             "same_page": b.get("same_page", False)}
+            for b in (comment_boxes or [{}])]
+        known = {s["name"] for s in self.sections}
+        for b in self.comment_boxes:
+            if b["after_section"] is not None and b["after_section"] not in known:
+                raise ValueError(
+                    f"Comment box {b['name']!r}: after_section "
+                    f"{b['after_section']!r} is not a section name.")
+        if comment_intro:
+            self._add_comment_intro(comment_intro)
         # Lowest passing mark = the lowest non-failing letter's threshold.
         passing = [m for l, m in grade_letters if l not in ("F", "FX")]
         self.grade_pass = min(passing) if passing else 0.0
+
+    def _question_numbers(self):
+        """Map each comment box to the question numbers it covers.
+
+        Moodle numbers the slots a student answers and skips `description`
+        blocks, so these are display numbers, not slot numbers. Returns
+        {box name: (first, last, box_number)} over the questions of the box's
+        own area — the area runs from the end of the previous box to this one.
+        """
+        if self.essays_last:
+            raise ValueError("comment_intro needs section order "
+                             "(essays_last=False)")
+        boxes = {b["after_section"]: b for b in self.comment_boxes}
+        out, number, area_start = {}, 0, None
+        for section in self.sections:
+            for item in section["items"]:
+                if item["qtype"] != "description":
+                    number += 1
+                    area_start = area_start or number
+            box = boxes.get(section["name"])
+            if box is not None:
+                out[box["name"]] = (area_start, number, number + 1)
+                number += 1          # the box itself is an answerable slot
+                area_start = None
+        return out
+
+    def _add_comment_intro(self, intro):
+        """Put an up-front block at the top of the quiz telling students which
+        comment box each question belongs to — a comment in the wrong box
+        isn't seen by the marker of that part."""
+        ranges = self._question_numbers()
+        rows_sv, rows_en = [], []
+        for box in self.comment_boxes:
+            first, last, box_no = ranges[box["name"]]
+            span_sv = (f"Fråga {first}" if first == last
+                       else f"Frågorna {first}–{last}")
+            span_en = (f"Question {first}" if first == last
+                       else f"Questions {first}–{last}")
+            rows_sv.append(f"<li><strong>{span_sv}</strong> → "
+                           f"{escape(box['area_sv'])} (fråga {box_no})</li>")
+            rows_en.append(f"<li><strong>{span_en}</strong> → "
+                           f"{escape(box['area_en'])} (question {box_no})</li>")
+        text = (f"<p>{intro['lead_sv']}</p>\n<ul>{''.join(rows_sv)}</ul>\n"
+                f"<p><em>{intro['lead_en']}</em></p>\n<ul>{''.join(rows_en)}</ul>")
+        self.sections.insert(0, {
+            "name": intro.get("heading", "Information"),
+            "items": [{"qtype": "description",
+                       "name": intro.get("name", "Information"),
+                       "text": text, "points": 0.0, "raw_text": False}]})
+        # numbering shifts by nothing (a description isn't numbered), but each
+        # box now also states its own span.
+        for box in self.comment_boxes:
+            first, last, _ = ranges[box["name"]]
+            span = (f"{first}" if first == last else f"{first}–{last}")
+            box["text"] += (f"\n\nDenna ruta gäller frågorna {span}. "
+                            f"/ This box is for questions {span}.")
 
     def _normalize_section(self, sec):
         """Ensure a section has an `items` list. Back-compat: build items from
@@ -214,6 +312,58 @@ class MoodleBackupBuilder:
             '                </plugin_qtype_multichoice_question>']
         return '\n'.join(lines), aid
 
+    def _multiselect_plugin(self, item, inner_id, aid):
+        """Select-all-that-apply (Moodle multichoice with single=0).
+
+        Scoring follows the author's rule: each correct tick is worth 1/threshold
+        and each wrong tick costs the same, so a wrong answer cancels a right one
+        and `threshold` correct ticks earn the full mark. Moodle clamps the
+        question grade to [0, max], so over-answering can't exceed full marks and
+        a bad answer can't go negative. `threshold` defaults to "all correct".
+
+        Note: the positive fractions deliberately sum to more than 100% when the
+        threshold is lower than the number of correct options — that is what
+        makes the threshold work. Moodle's editing form flags that if the
+        question is ever opened and re-saved by hand.
+        """
+        options = item["options"]
+        n_correct = sum(1 for o in options if o.get("correct"))
+        if not n_correct:
+            raise ValueError(f"{item['name']}: no correct option")
+        threshold = item.get("threshold") or n_correct
+        frac = 1.0 / threshold
+
+        lines = ['                <plugin_qtype_multichoice_question>',
+                 '                  <answers>']
+        for o in options:
+            lines += [f'                    <answer id="{aid}">',
+                      f'                      <answertext>{escape(o["text"])}</answertext>',
+                      '                      <answerformat>1</answerformat>',
+                      f'                      <fraction>{frac if o.get("correct") else -frac:.7f}</fraction>',
+                      f'                      <feedback>{escape(o.get("feedback", ""))}</feedback>',
+                      '                      <feedbackformat>1</feedbackformat>',
+                      '                    </answer>']
+            aid += 1
+        shuffle = 1 if item.get("shuffle", True) else 0
+        lines += [
+            '                  </answers>',
+            f'                  <multichoice id="{inner_id}">',
+            '                    <layout>0</layout>',
+            '                    <single>0</single>',
+            f'                    <shuffleanswers>{shuffle}</shuffleanswers>',
+            '                    <correctfeedback></correctfeedback>',
+            '                    <correctfeedbackformat>1</correctfeedbackformat>',
+            '                    <partiallycorrectfeedback></partiallycorrectfeedback>',
+            '                    <partiallycorrectfeedbackformat>1</partiallycorrectfeedbackformat>',
+            '                    <incorrectfeedback></incorrectfeedback>',
+            '                    <incorrectfeedbackformat>1</incorrectfeedbackformat>',
+            '                    <answernumbering>abc</answernumbering>',
+            '                    <shownumcorrect>0</shownumcorrect>',
+            '                    <showstandardinstruction>1</showstandardinstruction>',
+            '                  </multichoice>',
+            '                </plugin_qtype_multichoice_question>']
+        return '\n'.join(lines), aid
+
     def _gapselect_plugin(self, item, inner_id, aid):
         """Unified dropdown. [[N]] in the text picks option N (1-based); all
         options share group 1; fraction is unused (gapselect convention)."""
@@ -266,12 +416,18 @@ class MoodleBackupBuilder:
             '                </plugin_qtype_shortanswer_question>']
         return '\n'.join(lines), aid
 
-    def _essay_plugin(self, inner_id):
+    def _essay_plugin(self, inner_id, item=None):
+        """Free-text answer. `response_format` ("editor" by default, or "plain")
+        and `lines` size the input: a short factual answer gets a small plain
+        box, a real essay the full editor."""
+        item = item or {}
+        response_format = item.get("response_format", "editor")
+        lines = item.get("lines", 25)
         return f"""                <plugin_qtype_essay_question>
                   <essay id="{inner_id}">
-                    <responseformat>editor</responseformat>
+                    <responseformat>{response_format}</responseformat>
                     <responserequired>1</responserequired>
-                    <responsefieldlines>25</responsefieldlines>
+                    <responsefieldlines>{lines}</responsefieldlines>
                     <minwordlimit>$@NULL@$</minwordlimit>
                     <maxwordlimit>$@NULL@$</maxwordlimit>
                     <attachments>0</attachments>
@@ -285,9 +441,20 @@ class MoodleBackupBuilder:
                   </essay>
                 </plugin_qtype_essay_question>"""
 
+    def _register_images(self, item, qid):
+        """Record an item's image files against its question id. The question
+        text refers to them as @@PLUGINFILE@@/<filename> (Moodle rewrites that
+        to the real URL on restore)."""
+        paths = item.get("images") or ([item["image"]] if item.get("image") else [])
+        if not paths:
+            return
+        # itemid is the <question id>, which _render_entry writes as qid+10000.
+        self._question_files[qid + 10000] = [(Path(p).name, Path(p)) for p in paths]
+
     def _render_item(self, item, qid, cat_id, aid):
         """Dispatch one item to its qtype renderer. Returns (xml, new_aid)."""
         qtype = item["qtype"]
+        self._register_images(item, qid)
         inner_id = qid + 10000
         if "plugin_xml" in item:
             # Lifted verbatim from an export (mbz_extract.extract_question):
@@ -310,6 +477,15 @@ class MoodleBackupBuilder:
                 qid=qid, cat_id=cat_id, name=name, questiontext=q["question"],
                 qtype="multichoice", points=item["points"], plugin_xml=plugin,
                 penalty=0.3333333)
+        elif qtype == "multiselect":
+            plugin, aid = self._multiselect_plugin(item, inner_id, aid)
+            xml = self._render_entry(
+                qid=qid, cat_id=cat_id, name=item["name"],
+                questiontext=item["text"], qtype="multichoice",
+                points=item["points"], plugin_xml=plugin,
+                generalfeedback=item.get("generalfeedback", ""),
+                raw_text=item.get("raw_text", False),
+                raw_feedback=item.get("raw_feedback", False))
         elif qtype == "gapselect":
             plugin, aid = self._gapselect_plugin(item, inner_id, aid)
             xml = self._render_entry(
@@ -325,7 +501,7 @@ class MoodleBackupBuilder:
                 points=item["points"], plugin_xml=plugin,
                 generalfeedback=item.get("generalfeedback", ""))
         elif qtype == "essay":
-            plugin = self._essay_plugin(inner_id)
+            plugin = self._essay_plugin(inner_id, item)
             xml = self._render_entry(
                 qid=qid, cat_id=cat_id, name=item["name"],
                 questiontext=item["text"], qtype="essay",
@@ -340,6 +516,55 @@ class MoodleBackupBuilder:
         else:
             raise ValueError(f"Unknown qtype: {qtype}")
         return xml, aid
+
+    # Sha1 of the empty string — Moodle's contenthash for a directory record.
+    EMPTY_HASH = "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+
+    def _file_record(self, fid, *, contenthash, itemid, filename, filesize,
+                     mimetype):
+        null = "$@NULL@$"
+        return f"""  <file id="{fid}">
+    <contenthash>{contenthash}</contenthash>
+    <contextid>{self.COURSE_CONTEXT_ID}</contextid>
+    <component>question</component>
+    <filearea>questiontext</filearea>
+    <itemid>{itemid}</itemid>
+    <filepath>/</filepath>
+    <filename>{escape(filename)}</filename>
+    <userid>1</userid>
+    <filesize>{filesize}</filesize>
+    <mimetype>{mimetype or null}</mimetype>
+    <status>0</status>
+    <timecreated>{self.now}</timecreated>
+    <timemodified>{self.now}</timemodified>
+    <source>{null}</source>
+    <author>{null}</author>
+    <license>{'allrightsreserved' if filesize else null}</license>
+    <sortorder>0</sortorder>
+    <repositorytype>{null}</repositorytype>
+    <repositoryid>{null}</repositoryid>
+    <reference>{null}</reference>
+  </file>"""
+
+    def _files_xml(self):
+        """files.xml: one directory record plus one record per image, per
+        question that carries images."""
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<files>']
+        fid = 900000
+        for itemid in sorted(self._question_files):
+            fid += 1
+            lines.append(self._file_record(
+                fid, contenthash=self.EMPTY_HASH, itemid=itemid, filename=".",
+                filesize=0, mimetype=None))
+            for filename, path in self._question_files[itemid]:
+                fid += 1
+                data = Path(path).read_bytes()
+                lines.append(self._file_record(
+                    fid, contenthash=hashlib.sha1(data).hexdigest(),
+                    itemid=itemid, filename=filename, filesize=len(data),
+                    mimetype=mimetypes.guess_type(filename)[0] or "application/octet-stream"))
+        lines.append('</files>')
+        return '\n'.join(lines) + '\n'
 
     def _question_category_xml(self, cat_id, name, parent):
         return f"""  <question_category id="{cat_id}">
@@ -389,29 +614,27 @@ class MoodleBackupBuilder:
             lines.append('    </question_bank_entries>')
             lines.append('  </question_category>')
 
-        # Comment box (0-point essay for legal requirement)
-        qid += 1
-        comment_cat_id = self.Q_CAT_TOP + 1 + len(self.sections)
-        self._q_cat_ids.append(comment_cat_id)
-        comment_text = (
-            "I den här rutan kan ni lämna kommentarer för uppgifter på tentan. "
-            "Om ni har en kommentar för någon uppgift, skriv då först uppgiftsnumret "
-            "och sedan kommentaren.\n\n"
-            "In this box you can leave comments for tasks on the exam. "
-            "If you have a comment for a question, write the question number first "
-            "and then the comment."
-        )
-        lines.append(self._question_category_xml(comment_cat_id, "Comments", self.Q_CAT_TOP))
-        lines.append('    <question_bank_entries>')
-        comment_xml, _ = self._render_item(
-            {"qtype": "essay", "name": "Kommentarer / Comments",
-             "text": comment_text, "points": 0.0, "raw_text": False},
-            qid, comment_cat_id, aid)
-        lines.append(comment_xml)
-        lines.append('    </question_bank_entries>')
-        lines.append('  </question_category>')
-        self._comment_slot = {"entry_id": qid, "points": 0.0,
-                              "section": "Comments", "qtype": "essay"}
+        # Comment boxes (0-point essays for legal requirement), one per area.
+        self._comment_slots = []
+        for box_idx, box in enumerate(self.comment_boxes):
+            qid += 1
+            comment_cat_id = self.Q_CAT_TOP + 1 + len(self.sections) + box_idx
+            self._q_cat_ids.append(comment_cat_id)
+            lines.append(self._question_category_xml(
+                comment_cat_id, escape(box["category"]), self.Q_CAT_TOP))
+            lines.append('    <question_bank_entries>')
+            comment_xml, aid = self._render_item(
+                {"qtype": "essay", "name": box["name"],
+                 "text": box["text"], "points": 0.0, "raw_text": False},
+                qid, comment_cat_id, aid)
+            lines.append(comment_xml)
+            lines.append('    </question_bank_entries>')
+            lines.append('  </question_category>')
+            self._comment_slots.append(
+                {"entry_id": qid, "points": 0.0, "section": box["category"],
+                 "qtype": "essay", "heading": box["heading"],
+                 "after_section": box["after_section"],
+                 "same_page": box["same_page"]})
 
         lines.append('</question_categories>')
         return '\n'.join(lines)
@@ -442,8 +665,27 @@ class MoodleBackupBuilder:
         else:
             for s in self._slots:
                 ordered_slots.append({**s, "heading": s["section"]})
-        ordered_slots.append({**self._comment_slot,
-                              "heading": "Kommentarer / Comments"})
+        # Each comment box follows the last slot of its area's final section;
+        # a box without `after_section` goes at the very end of the quiz.
+        for box in self._comment_slots:
+            slot = {k: v for k, v in box.items()
+                    if k not in ("after_section", "same_page")}
+            after = box["after_section"]
+            if after is None:
+                ordered_slots.append(slot)
+                continue
+            positions = [i for i, s in enumerate(ordered_slots)
+                         if s["section"] == after]
+            if not positions:
+                raise ValueError(
+                    f"Comment box {slot['heading']!r}: section {after!r} has no "
+                    f"questions, so there is nothing to place it after.")
+            if box["same_page"]:
+                # Share the area's own heading: a new heading would force a new
+                # page, and a one-topic part reads better with its comment box
+                # right under the question.
+                slot["heading"] = ordered_slots[max(positions)]["heading"]
+            ordered_slots.insert(max(positions) + 1, slot)
 
         n_graded = sum(1 for s in self._slots if s["points"] > 0)
 
@@ -1247,7 +1489,19 @@ class MoodleBackupBuilder:
             add(tar, "gradebook.xml", self._gradebook_xml())
             add(tar, "scales.xml", EMPTY_XML + '<scales_definition>\n</scales_definition>\n')
             add(tar, "roles.xml", EMPTY_XML + '<roles_definition>\n</roles_definition>\n')
-            add(tar, "files.xml", EMPTY_XML + '<files>\n</files>\n')
+            add(tar, "files.xml", self._files_xml())
+            stored = set()
+            for entries in self._question_files.values():
+                for _, path in entries:
+                    data = Path(path).read_bytes()
+                    digest = hashlib.sha1(data).hexdigest()
+                    if digest in stored:   # one blob per content, reused
+                        continue
+                    stored.add(digest)
+                    info = tarfile.TarInfo(name=f"files/{digest[:2]}/{digest}")
+                    info.size = len(data)
+                    info.mtime = self.now
+                    tar.addfile(info, BytesIO(data))
             add(tar, "completion.xml", EMPTY_XML + '<course_completion>\n</course_completion>\n')
             add(tar, "outcomes.xml", EMPTY_XML + '<outcomes_definition>\n</outcomes_definition>\n')
             add(tar, "groups.xml", EMPTY_XML + '<groups>\n  <groupings>\n  </groupings>\n</groups>\n')
